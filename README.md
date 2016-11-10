@@ -1,19 +1,21 @@
 # paintingReorganize
 
-## To install:
+## To install
 
 pip install -r requirements.txt
 
 If that doesn't work you will have to manually track down and install these pip packages.
 
-## To use:
+## To use
 
 python palette.py /path/to/input_file.jpg
 
 Output will be written to output.png
 
-## Example:
-Input (Kupka, Frantisek (1871-1957) - 1910-11 Mme Kupka Among Verticals (MoMA)):
+## Example
+Input:
+
+Kupka - Mme Kupka Among Verticals
 ![Input](input.jpg "Input")
 
 Output:
