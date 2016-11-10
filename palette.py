@@ -12,6 +12,10 @@ if len(sys.argv) < 2:
 
 filename = os.path.expanduser(sys.argv[1]) 
 
+output_name = "output.png"
+if len(sys.argv) > 2:
+  output_name = os.path.expanduser(sys.argv[2])
+
 image = scipy.misc.imread(filename)[:,:, :3]
 
 original_shape = image.shape
@@ -52,7 +56,7 @@ for column in range(n_columns):
 
 
 im = Image.fromarray(new_image)
-im.save("output.png")
+im.save(output_name)
   
   
   
