@@ -6,6 +6,10 @@ import os
 import sys
 from sklearn.decomposition import PCA
 
+if len(sys.argv) < 2:
+  print 'Please specify an input image.'
+  sys.exit()
+
 filename = os.path.expanduser(sys.argv[1]) 
 
 image = scipy.misc.imread(filename)[:,:, :3]
