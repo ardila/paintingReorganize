@@ -16,10 +16,10 @@ Output will be written to output.png
 Input:
 
 Kupka - Mme Kupka Among Verticals
+
 ![Input](input.jpg "Input")
 
 Output:
-
 
 ![Output](output.png "Output")
 
