@@ -30,15 +30,16 @@ new_image = np.zeros_like(image)
 old_column = None
 
 for column in range(n_columns):
+  if column % 10 == 0:
+    print 'processing column %s of %s' % (column, n_columns)
   pixels_in_column = pixels_by_first_component[n_rows*column:(column+1)*n_rows]
-  print pixels_in_column.shape
   first_column_component = np.squeeze(pca.fit_transform(pixels_in_column))
   new_column = pixels_in_column[np.argsort(first_column_component)]
   
+  # Now figure out which direction will match the previous column better
   if old_column is not None:
     distance = np.mean(np.sqrt(np.sum((new_column - old_column)**2, 1)))
     flipped_distance = np.mean(np.sqrt(np.sum((new_column[-1::-1] - old_column)**2, 1)))
-    print distance-flipped_distance
     if flipped_distance < distance:
       new_column = new_column[-1::-1]   
   old_column = new_column
