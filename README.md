@@ -24,6 +24,7 @@ Output:
 
 ## How it works
 Mostly based on PCA [a little tutorial on what that means here](https://www.quora.com/Where-can-I-find-a-detailed-tutorial-about-the-principal-component-analysis)
+
 1. Organize pixels according to their first principal component (the direction along which variance is greatest)
 
 2. Grab a column of pixels at a time, and organize them according to their first principal component
