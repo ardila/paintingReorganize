@@ -10,11 +10,11 @@ If that doesn't work you will have to manually track down and install these pip 
 
 python palette.py /path/to/input_file.jpg
 
-Output will be written to output.jpg
+Output will be written to output.png
 
 ## Example:
 ![Input](input.jpg "Input")
-![Output](output.jpg "Output")
+![Output](output.png "Output")
 
 
 ## How it works
