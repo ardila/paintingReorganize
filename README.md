@@ -31,4 +31,4 @@ Mostly based on PCA [a little tutorial on what that means here](https://www.quor
 
 2. Grab a column of pixels at a time, and organize them according to their first principal component
 
-3. Use the resulting columns one by one in the final result. With each column, check to see if flipping it upside down gives a better match.
+3. Use the resulting columns one by one in the final result. With each column, check to see if flipping it upside down gives a better match to the previous column.
