@@ -12,7 +12,7 @@ python palette.py /path/to/input_file.jpg
 
 Output will be written to output.png
 
-## Example
+## Examples
 Input:
 
 Kupka - Mme Kupka Among Verticals
@@ -22,6 +22,40 @@ Kupka - Mme Kupka Among Verticals
 Output:
 
 ![Output](output.png "Output")
+
+Input:
+
+Van Gogh - Starry Night
+
+![Input](starry_night.png "Input")
+
+Output:
+
+![Output](starry_night_palette.png "Input")
+
+Input:
+
+Picasso - Demoiselles D'Avignon
+
+![Input](demoiselles.jpg "Input")
+
+Output:
+
+![Output](demoiselles_palette.png "Input")
+
+
+Input:
+
+Cezanne - The Large Bathers
+
+![Input](the_large_bathers.jpg "Input")
+
+Output:
+
+![Output](the_large_bathers_palette.png "Input")
+
+
+
 
 
 ## How it works
