@@ -2,6 +2,11 @@ name: generate-demos
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - claude/brave-newton-xsqgpe
+    paths-ignore:
+      - '*.png'
 
 permissions:
   contents: write
@@ -24,5 +29,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add demo_*.png *_smooth.png
-          git commit -m "Add generated before/after demo images"
+          git commit -m "Add generated before/after demo images [skip ci]"
           git push
