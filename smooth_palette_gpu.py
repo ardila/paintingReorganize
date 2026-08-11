@@ -186,7 +186,7 @@ def sweep(img, F, kern, lam, T, batch=0.30, min_sep=3, gen=None):
     tmp = flat[:, ai].clone()
     flat[:, ai] = flat[:, bi]
     flat[:, bi] = tmp
-    return int(acc.sum().item())
+    return int(acc.sum().item()), int(gain.numel())
 
 
 def sliding_palette_np(rgb):
@@ -280,6 +280,68 @@ def run(rgb, sweeps=6000, lam=12.0, device='cuda',
     assert np.array_equal(np.sort(out.reshape(-1, 3), axis=0),
                           np.sort(rgb.reshape(-1, 3), axis=0)), \
         "output is not a rearrangement of the input pixels"
+    return out
+
+
+def run_constant_motion(rgb, sweeps=6000, lam=12.0, motion=0.03,
+                        device='cuda', seed=11, gain_k=0.15, verbose=True,
+                        log_every=500, frame_every=0, on_frame=None):
+    """Servo the temperature so a fixed fraction of proposed swaps is
+    accepted on every sweep ("constant motion" annealing).
+
+    Instead of imposing a temperature curve, hold the OBSERVABLE - the
+    fraction of proposals accepted - at `motion`.  A multiplicative
+    controller nudges T after every sweep: too much motion -> cool, too
+    little -> warm.  The consequence is an emergent coarse-to-fine
+    schedule: while coarse structure is still negotiable, 3% motion is
+    available at high T; once it locks in, the controller must cool to
+    keep anything moving, so T decays at exactly the rate the painting's
+    own freezing dictates.  This is the practical form of the Lam /
+    constant-thermodynamic-speed schedules from the annealing
+    literature, with the target set low so the seed is never melted -
+    the run sculpts continuously instead of exploding and refreezing.
+
+    Ends with the usual greedy settle to drain residual thermal noise.
+    """
+    dev = torch.device(device if torch.cuda.is_available() or device == 'cpu'
+                       else 'cpu')
+    seed_img = sliding_palette_np(rgb)
+    img = torch.tensor(seed_img.transpose(2, 0, 1).astype(np.float32),
+                       device=dev)
+    ref = torch.tensor(rgb.transpose(2, 0, 1).astype(np.float32), device=dev)
+    H, W = img.shape[1], img.shape[2]
+    kern = MultiScaleKernel(min(H, W))
+    F = make_field(ref)
+    gen = torch.Generator(device=dev).manual_seed(seed)
+    T = calibrate_t0(img, F, kern, lam, accept=motion, gen=gen)
+    if verbose:
+        print(f"device={dev} {W}x{H} {kern.describe()} motion={motion} "
+              f"T_start={T:.1f}", flush=True)
+
+    def grab(i):
+        if on_frame is not None and frame_every and i % frame_every == 0:
+            on_frame(i, img.clamp(0, 255).round().to(torch.uint8)
+                     .cpu().numpy().transpose(1, 2, 0))
+
+    start = time.time()
+    grab(0)
+    for i in range(sweeps):
+        acc_n, prop_n = sweep(img, F, kern, lam, T, gen=gen)
+        a = max(acc_n / max(prop_n, 1), 1e-4)
+        ratio = (a / motion) ** (-gain_k)          # too much motion -> cool
+        T = float(np.clip(T * np.clip(ratio, 0.7, 1.4), 1e-4, 1e9))
+        grab(i + 1)
+        if verbose and (i + 1) % log_every == 0:
+            el = time.time() - start
+            print(f"  {i+1}/{sweeps} T={T:10.3f} motion={a:.4f} "
+                  f"{el:6.1f}s", flush=True)
+    for j in range(300):
+        sweep(img, F, kern, lam, 0.0, gen=gen)
+        grab(sweeps + j + 1)
+
+    out = img.clamp(0, 255).round().to(torch.uint8).cpu().numpy()         .transpose(1, 2, 0)
+    assert np.array_equal(np.sort(out.reshape(-1, 3), axis=0),
+                          np.sort(rgb.reshape(-1, 3), axis=0)),         "output is not a rearrangement of the input pixels"
     return out
 
 
