@@ -117,18 +117,75 @@ class MultiScaleKernel:
         self.b = hollow * a
 
     def potential(self, img):
-        out = torch.zeros_like(img)
+        """Single-pass pyramid evaluation of the whole octave ladder.
+
+        Octaves are grouped by the pyramid level they would be computed
+        at; each level is pooled once from the previous, blurred with its
+        (small) residual sigmas, and results are accumulated coarse-to-
+        fine through one chain of upsamples - instead of re-pooling from
+        full resolution once per octave."""
+        C, H, W = img.shape
+        by_level = {}
         for s, a in zip(self.sigmas, self.weights):
-            out += a * blur(img, s)
-        return out - self.b * blur(img, self.s_in)
+            f = 1
+            while s / (2 * f) > 8.0 and min(H, W) // (2 * f) >= 8:
+                f *= 2
+            by_level.setdefault(f, []).append((s / f, a))
+        levels = sorted(by_level)
+        pyr = {1: img}
+        cur = img
+        f = 1
+        for lv in levels:
+            while f < lv:
+                cur = torch.nn.functional.avg_pool2d(
+                    cur.unsqueeze(0), 2).squeeze(0)
+                f *= 2
+                pyr[f] = cur
+        acc = None
+        for lv in reversed(levels):
+            part = torch.zeros_like(pyr[lv])
+            for sig, a in by_level[lv]:
+                part += a * _blur_direct(pyr[lv], sig)
+            if acc is None:
+                acc = part
+            else:
+                acc = part + torch.nn.functional.interpolate(
+                    acc.unsqueeze(0), size=pyr[lv].shape[1:],
+                    mode='bilinear', align_corners=False).squeeze(0)
+        if acc.shape[1:] != (H, W):
+            acc = torch.nn.functional.interpolate(
+                acc.unsqueeze(0), size=(H, W), mode='bilinear',
+                align_corners=False).squeeze(0)
+        return acc - self.b * blur(img, self.s_in)
+
+    _WTAB_STEP = 0.25
+
+    def _w_table(self, device, dtype, max_r):
+        key = (str(device), str(dtype))
+        tab = getattr(self, '_wtabs', {}).get(key)
+        if tab is None or tab[1] < max_r:
+            r = torch.arange(0, max_r + 1.0, self._WTAB_STEP,
+                             device=device, dtype=dtype)
+            vals = torch.zeros_like(r)
+            r2 = r * r
+            for sg, a in zip(self.sigmas, self.weights):
+                vals += a * torch.exp(-r2 / (2 * sg * sg)) / (2 * math.pi * sg * sg)
+            vals -= self.b * torch.exp(-r2 / (2 * self.s_in ** 2)) \
+                / (2 * math.pi * self.s_in ** 2)
+            if not hasattr(self, '_wtabs'):
+                self._wtabs = {}
+            self._wtabs[key] = (vals, max_r)
+            tab = self._wtabs[key]
+        return tab[0]
 
     def w_at(self, r2):
-        acc = torch.zeros_like(r2)
-        for s, a in zip(self.sigmas, self.weights):
-            acc += a * torch.exp(-r2 / (2 * s * s)) / (2 * math.pi * s * s)
-        acc -= self.b * torch.exp(-r2 / (2 * self.s_in ** 2)) \
-            / (2 * math.pi * self.s_in ** 2)
-        return acc
+        """Lookup-table kernel evaluation: one gather instead of one exp
+        per octave per proposed pair."""
+        r = torch.sqrt(r2)
+        max_r = float(r.max()) if r.numel() else 1.0
+        tab = self._w_table(r2.device, r2.dtype, max_r + 2.0)
+        idx = (r / self._WTAB_STEP).round().long().clamp(max=tab.numel() - 1)
+        return tab[idx]
 
     def describe(self):
         return (f"sigmas={[round(s,1) for s in self.sigmas]} "
@@ -152,13 +209,41 @@ def make_field(rgb_t):
             + Y.unsqueeze(0) * u2.view(3, 1, 1))
 
 
-def sweep(img, F, kern, lam, T, batch=0.30, min_sep=3, gen=None):
-    """One parallel batch of proposed exchanges, Metropolis-accepted."""
+_PERM_CACHE = {}
+
+
+def _pair_sample(n, m, device, gen, refresh=16):
+    """m random sites without replacement, from a cached permutation.
+
+    A full randperm of n elements every sweep is a top-3 cost at 10 MP.
+    The cache refreshes the permutation every `refresh` uses and applies
+    a random roll per use, so pairings still vary sweep to sweep while
+    sites within a batch stay distinct (which the swap-apply step
+    requires - duplicated sites would corrupt the permutation)."""
+    key = (n, str(device))
+    perm, uses = _PERM_CACHE.get(key, (None, 0))
+    if perm is None or uses >= refresh:
+        perm = torch.randperm(n, device=device, generator=gen)
+        uses = 0
+    _PERM_CACHE[key] = (perm, uses + 1)
+    off = int(torch.randint(0, n, (1,), generator=gen,
+                            device=device).item())
+    return torch.roll(perm, off)[:m]
+
+
+def sweep(img, F, kern, lam, T, batch=0.30, min_sep=3, gen=None, phi=None):
+    """One parallel batch of proposed exchanges, Metropolis-accepted.
+
+    phi: pass a precomputed kern.potential(img) to reuse across several
+    sweeps.  At low acceptance rates barely any pixels move per sweep,
+    so a slightly stale potential is an excellent trade - it is the
+    dominant per-sweep cost."""
     C, H, W = img.shape
     n = H * W
-    phi = kern.potential(img)
+    if phi is None:
+        phi = kern.potential(img)
     m = (int(n * batch) // 2) * 2
-    perm = torch.randperm(n, device=img.device, generator=gen)[:m]
+    perm = _pair_sample(n, m, img.device, gen)
     a, b = perm[:m // 2], perm[m // 2:]
     ya, xa = a // W, a % W
     yb, xb = b // W, b % W
@@ -232,9 +317,19 @@ def calibrate_t0(img, F, kern, lam, accept=0.25, n_sample=200000, gen=None):
     return med / math.log(accept)          # both negative -> T0 positive
 
 
+def _frame(img, scale):
+    """Downscale ON DEVICE before the GPU->CPU transfer - at 10 MP the
+    full-resolution transfer plus CPU resize dominates video capture."""
+    t = img
+    if scale > 1:
+        t = torch.nn.functional.avg_pool2d(t.unsqueeze(0), scale).squeeze(0)
+    return t.clamp(0, 255).round().to(torch.uint8).cpu().numpy() \
+        .transpose(1, 2, 0)
+
+
 def run(rgb, sweeps=6000, lam=12.0, device='cuda',
         t0='auto', accept=0.25, t1_frac=2e-5, seed=11, verbose=True, log_every=500,
-        frame_every=0, on_frame=None):
+        frame_every=0, on_frame=None, frame_scale=1, phi_every=1):
     """t0: starting temperature, or 'auto' to calibrate from the seed's
     energy landscape (recommended - transfers across image sizes).
     t1_frac: final temperature as a fraction of t0.
@@ -259,21 +354,25 @@ def run(rgb, sweeps=6000, lam=12.0, device='cuda',
 
     def grab(i):
         if on_frame is not None and frame_every and i % frame_every == 0:
-            on_frame(i, img.clamp(0, 255).round().to(torch.uint8)
-                     .cpu().numpy().transpose(1, 2, 0))
+            on_frame(i, _frame(img, frame_scale))
 
     start = time.time()
     grab(0)
+    phi = None
     for i in range(sweeps):
         T = t0 * (t1 / t0) ** (i / max(sweeps - 1, 1))
-        sweep(img, F, kern, lam, T, gen=gen)
+        if phi is None or i % max(phi_every, 1) == 0:
+            phi = kern.potential(img)
+        sweep(img, F, kern, lam, T, gen=gen, phi=phi)
         grab(i + 1)
         if verbose and (i + 1) % log_every == 0:
             el = time.time() - start
             print(f"  {i+1}/{sweeps} T={T:8.2f} {el:6.1f}s "
                   f"({el/(i+1)*1000:.1f} ms/sweep)", flush=True)
     for j in range(300):
-        sweep(img, F, kern, lam, 0.0, gen=gen)
+        if j % max(phi_every, 1) == 0:
+            phi = kern.potential(img)
+        sweep(img, F, kern, lam, 0.0, gen=gen, phi=phi)
         grab(sweeps + j + 1)
 
     out = img.clamp(0, 255).round().to(torch.uint8).cpu().numpy() \
@@ -286,7 +385,8 @@ def run(rgb, sweeps=6000, lam=12.0, device='cuda',
 
 def run_constant_motion(rgb, sweeps=6000, lam=12.0, motion=0.03,
                         device='cuda', seed=11, gain_k=0.15, verbose=True,
-                        log_every=500, frame_every=0, on_frame=None):
+                        log_every=500, frame_every=0, on_frame=None,
+                        frame_scale=1, phi_every='auto'):
     """Servo the temperature so a fixed fraction of proposed swaps is
     accepted on every sweep ("constant motion" annealing).
 
@@ -315,19 +415,25 @@ def run_constant_motion(rgb, sweeps=6000, lam=12.0, motion=0.03,
     F = make_field(ref)
     gen = torch.Generator(device=dev).manual_seed(seed)
     T = calibrate_t0(img, F, kern, lam, accept=motion, gen=gen)
+    if phi_every == 'auto':
+        # staleness budget: fraction of pixels moved between potential
+        # rebuilds ~ motion * batch * 2 * phi_every, held near 2.5%
+        phi_every = int(np.clip(0.025 / (motion * 0.6), 1, 16))
     if verbose:
         print(f"device={dev} {W}x{H} {kern.describe()} motion={motion} "
-              f"T_start={T:.1f}", flush=True)
+              f"T_start={T:.1f} phi_every={phi_every}", flush=True)
 
     def grab(i):
         if on_frame is not None and frame_every and i % frame_every == 0:
-            on_frame(i, img.clamp(0, 255).round().to(torch.uint8)
-                     .cpu().numpy().transpose(1, 2, 0))
+            on_frame(i, _frame(img, frame_scale))
 
     start = time.time()
     grab(0)
+    phi = None
     for i in range(sweeps):
-        acc_n, prop_n = sweep(img, F, kern, lam, T, gen=gen)
+        if phi is None or i % max(phi_every, 1) == 0:
+            phi = kern.potential(img)
+        acc_n, prop_n = sweep(img, F, kern, lam, T, gen=gen, phi=phi)
         a = max(acc_n / max(prop_n, 1), 1e-4)
         ratio = (a / motion) ** (-gain_k)          # too much motion -> cool
         T = float(np.clip(T * np.clip(ratio, 0.7, 1.4), 1e-4, 1e9))
@@ -337,7 +443,9 @@ def run_constant_motion(rgb, sweeps=6000, lam=12.0, motion=0.03,
             print(f"  {i+1}/{sweeps} T={T:10.3f} motion={a:.4f} "
                   f"{el:6.1f}s", flush=True)
     for j in range(300):
-        sweep(img, F, kern, lam, 0.0, gen=gen)
+        if j % max(phi_every, 1) == 0:
+            phi = kern.potential(img)
+        sweep(img, F, kern, lam, 0.0, gen=gen, phi=phi)
         grab(sweeps + j + 1)
 
     out = img.clamp(0, 255).round().to(torch.uint8).cpu().numpy()         .transpose(1, 2, 0)
