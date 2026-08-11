@@ -210,25 +210,28 @@ def make_field(rgb_t):
 
 
 _PERM_CACHE = {}
+_PY_RNG = __import__('random').Random(1234)
 
 
 def _pair_sample(n, m, device, gen, refresh=16):
     """m random sites without replacement, from a cached permutation.
 
-    A full randperm of n elements every sweep is a top-3 cost at 10 MP.
-    The cache refreshes the permutation every `refresh` uses and applies
-    a random roll per use, so pairings still vary sweep to sweep while
-    sites within a batch stay distinct (which the swap-apply step
-    requires - duplicated sites would corrupt the permutation)."""
+    GPU notes: the permutation is cached (a full randperm of n every
+    sweep is a top-3 cost at 10 MP); the per-sweep offset comes from a
+    CPU-side RNG because drawing it on-device and .item()-ing it forces
+    a full pipeline sync every sweep; and the windowed read is two views
+    plus one m-sized concat rather than torch.roll, which would allocate
+    and copy all n indices to extract m of them."""
     key = (n, str(device))
     perm, uses = _PERM_CACHE.get(key, (None, 0))
     if perm is None or uses >= refresh:
         perm = torch.randperm(n, device=device, generator=gen)
         uses = 0
     _PERM_CACHE[key] = (perm, uses + 1)
-    off = int(torch.randint(0, n, (1,), generator=gen,
-                            device=device).item())
-    return torch.roll(perm, off)[:m]
+    off = _PY_RNG.randrange(n)
+    if off + m <= n:
+        return perm[off:off + m]
+    return torch.cat([perm[off:], perm[:m - (n - off)]])
 
 
 def sweep(img, F, kern, lam, T, batch=0.30, min_sep=3, gen=None, phi=None):
@@ -248,8 +251,10 @@ def sweep(img, F, kern, lam, T, batch=0.30, min_sep=3, gen=None, phi=None):
     ya, xa = a // W, a % W
     yb, xb = b // W, b % W
     r2 = (ya - yb).to(img.dtype) ** 2 + (xa - xb).to(img.dtype) ** 2
-    keep = r2 >= float(min_sep * min_sep)
-    a, b, r2 = a[keep], b[keep], r2[keep]
+    # too-close pairs are auto-rejected via the mask rather than filtered
+    # out: filtering makes every sweep's tensor shapes dynamic, which
+    # churns the allocator and blocks CUDA-graph capture
+    far = r2 >= float(min_sep * min_sep)
 
     flat = img.reshape(3, -1)
     pf = phi.reshape(3, -1)
@@ -261,18 +266,21 @@ def sweep(img, F, kern, lam, T, batch=0.30, min_sep=3, gen=None, phi=None):
     fld = 0.5 * (d * (ff[:, a] - ff[:, b])).sum(0)
     gain = pair + lam * fld
 
-    if T <= 0:
-        acc = gain > 0
-    else:
+    if isinstance(T, torch.Tensor) or T > 0:
         u = torch.rand(gain.shape, device=img.device, dtype=img.dtype,
                        generator=gen)
         acc = (gain > 0) | (u < torch.exp(torch.clamp(gain / T, max=0.0)))
+    else:
+        acc = gain > 0
+    acc &= far
 
     ai, bi = a[acc], b[acc]
     tmp = flat[:, ai].clone()
     flat[:, ai] = flat[:, bi]
     flat[:, bi] = tmp
-    return int(acc.sum().item()), int(gain.numel())
+    # 0-dim device tensors: callers that .item() these force a sync, so
+    # the runners only do that at log points
+    return acc.sum(), far.sum()
 
 
 def sliding_palette_np(rgb):
@@ -414,14 +422,15 @@ def run_constant_motion(rgb, sweeps=6000, lam=12.0, motion=0.03,
     kern = MultiScaleKernel(min(H, W))
     F = make_field(ref)
     gen = torch.Generator(device=dev).manual_seed(seed)
-    T = calibrate_t0(img, F, kern, lam, accept=motion, gen=gen)
+    T = torch.tensor(calibrate_t0(img, F, kern, lam, accept=motion, gen=gen),
+                     device=dev, dtype=img.dtype)
     if phi_every == 'auto':
         # staleness budget: fraction of pixels moved between potential
         # rebuilds ~ motion * batch * 2 * phi_every, held near 2.5%
         phi_every = int(np.clip(0.025 / (motion * 0.6), 1, 16))
     if verbose:
         print(f"device={dev} {W}x{H} {kern.describe()} motion={motion} "
-              f"T_start={T:.1f} phi_every={phi_every}", flush=True)
+              f"T_start={float(T):.1f} phi_every={phi_every}", flush=True)
 
     def grab(i):
         if on_frame is not None and frame_every and i % frame_every == 0:
