@@ -16,11 +16,29 @@ rectangle, rearranged so the colour field reads as smooth.
 `--fast` runs stage 1 alone: already a large improvement over the
 original algorithm, and quick enough to iterate with.
 
-## Example
+## Examples
+
+Each strip is: original | old algorithm | new algorithm.
 
 Picasso — Les Demoiselles d'Avignon
 
-![Demo](demo_demoiselles.png "original | old algorithm | new algorithm")
+![Demo](demo_demoiselles.png "Les Demoiselles d'Avignon")
+
+Van Gogh — The Starry Night
+
+![Demo](demo_starry_night.png "The Starry Night")
+
+Cézanne — The Large Bathers
+
+![Demo](demo_the_large_bathers.png "The Large Bathers")
+
+Kupka — Mme Kupka Among Verticals
+
+![Demo](demo_kupka.png "Mme Kupka Among Verticals")
+
+Full-quality runs, 6000 sweeps each: Kupka 9 min (0.40M px), Bathers
+13 min (0.54M px), Demoiselles 27 min (0.90M px), Starry Night 95 min
+(3.03M px).  Cost is linear in pixel count.
 
 ## Stage 1 — sliding-window initialisation
 
@@ -117,3 +135,23 @@ must come back as constant columns. Its colour cloud is 1-D
 (λ₂/λ₁ ≈ 10⁻¹³), so any method that normalises the second axis amplifies
 floating-point noise and sorts rows by it. Rank-based layouts score 0.00
 error; sliced optimal transport scored 11.5/255.
+
+## An honest note on the metrics
+
+The multi-scale Huber loss (RGB, τ=25) rates the *old* algorithm ahead of
+the new one on all four paintings:
+
+| painting | original | old algorithm | new algorithm |
+|---|---|---|---|
+| Demoiselles | 129.9 | **25.7** | 38.4 |
+| Starry Night | 768.0 | **47.6** | 67.5 |
+| Large Bathers | 220.2 | **40.1** | 40.7 |
+| Kupka | 173.6 | **60.9** | 62.5 |
+
+Human judgement reverses this, consistently and not marginally. The old
+algorithm's outputs are blurrier, which minimises adjacent-pixel
+differences, while their boundaries are straight and grid-aligned and
+their columns visibly striped. Every metric here scores *how large*
+colour jumps are; none scores what *shape* the boundaries take, and that
+is what the eye is responding to. Treat the numbers as a guide to
+parameters (they track λ correctly) and not as the objective.
