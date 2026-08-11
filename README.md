@@ -1,98 +1,119 @@
 # paintingReorganize
 
-Reorganize the pixels of a painting into a smooth color palette: the
-output contains **exactly the same pixels** as the input, in the same
-dense rectangle, rearranged so the color field is as visually smooth as
-possible.
+Reorganize the pixels of a painting into a smooth colour palette. The
+output holds **exactly the same pixels** as the input, in the same dense
+rectangle, rearranged so the colour field reads as smooth.
 
-## To install
+## Install
 
     pip install -r requirements.txt
 
-## To use
+## Use
 
-    python smooth_palette.py /path/to/input_file.jpg [output.png]
+    python smooth_palette.py painting.jpg output.png          # full quality (minutes)
+    python smooth_palette.py painting.jpg output.png --fast   # initialisation only (seconds)
 
-Output is written to `output.png` unless a second argument is given.
+`--fast` runs stage 1 alone: already a large improvement over the
+original algorithm, and quick enough to iterate with.
 
-(`palette.py` is the original Python 2 algorithm, kept for reference.)
+## Example
 
-## Examples — before and after
+Picasso — Les Demoiselles d'Avignon
 
-Each demo shows: the original painting, the output of the old
-algorithm, and the output of the new one.
+![Demo](demo_demoiselles.png "original | old algorithm | new algorithm")
 
-Van Gogh — Starry Night
+## Stage 1 — sliding-window initialisation
 
-![Demo](demo_starry_night.png "Starry Night")
+The original `palette.py` sorted each output column using only that
+column's own pixels. The height of a colour boundary is then an order
+statistic of ~h samples, so it carries sampling noise of order √h rows —
+and neighbouring columns, estimating it independently, disagree. That
+disagreement is exactly what appeared as jagged "spikes" and vertical
+chatter.
 
-Picasso — Demoiselles D'Avignon
+Each column is instead cut from a **window** holding a few percent of the
+picture. The sort direction and the composition are estimated from that
+whole window, so the noise falls by √(pooled columns), and consecutive
+windows overlap by ~97%, so neighbours can barely disagree. Dealing every
+k-th pixel of the sorted window keeps each column spanning the full range
+— taking a contiguous block instead collapses the picture to colour =
+f(x).
 
-![Demo](demo_demoiselles.png "Demoiselles D'Avignon")
+Window size is a **noise-versus-two-dimensionality dial**: 1% is cleanest
+but flattens toward a horizontal sweep; 15% is richly 2-D but grainy. 3%
+is the default.
 
-Cezanne — The Large Bathers
+## Stage 2 — physical refinement
 
-![Demo](demo_the_large_bathers.png "The Large Bathers")
+Pixels are annealed under
 
-Kupka — Mme Kupka Among Verticals
+    E = Σ_{s≠t} w(p_s − p_t)‖C_s − C_t‖²  −  λ Σ_s C_s · F(p_s)
 
-![Demo](demo_kupka.png "Mme Kupka Among Verticals")
+**The one-body field `F(p) = a·x·u₁ + b·y·u₂`** (u₁,u₂ = principal colour
+axes) fixes the **composition**. Minimising it alone is precisely the
+optimal-transport map from the PC1/PC2 projection onto the grid, so the
+palette sweep becomes a genuine *equilibrium* rather than a state that
+decays as the run continues. A purely pairwise energy cannot achieve
+this: being invariant under rotating the picture, it can only prefer
+concentric blobs — with λ=0 the layout collapses into a bullseye.
 
-## The loss: what "smooth" means
+**The two-body kernel `w`** fixes the **texture**. It is a difference of
+Gaussians — repulsive below ~2.5px, attractive from ~3–20px. Plain
+attraction at r=1 gathers the leftover colour dimension into 2–4px clumps
+that read as grain; a hollow kernel leaves that residual as 1px dither,
+which the eye integrates away.
 
-The old algorithm implicitly optimized the *sum* of adjacent-pixel color
-differences.  That loss barely distinguishes a gentle 50-pixel ramp from
-one razor-sharp seam carrying the same total change — so its outputs
-could concentrate all the color variation into specks, mismatched
-columns, and hard edges.
+Pixels **exchange** rather than move, so the arrangement is a permutation
+at every instant and every site stays filled by construction — no density
+term to tune. Because the kernel is short-range and separable, `w * C`
+costs two Gaussian blurs instead of a padded FFT (~3.4× faster).
 
-The new loss is a multi-scale Huber penalty in CIELab.  Every pixel pair
-at offset *s* ∈ {1, 2, 4, 8} (weighted 1/s²) pays, for its color
-distance *d*:
+### The annealing gets worse before it gets better
 
-    huber(d) = d²                  if d ≤ τ·s
-               τ·s · (2d − τ·s)    otherwise
+On Demoiselles, local roughness runs **6.3 → 16.6** at peak heat **→ 4.6**
+at the end, while the composition dips before exceeding its starting
+value. Runs shorter than ~2500 sweeps show only the damage. This is the
+single most misleading thing about the method.
 
-* **Quadratic below the threshold**: many small steps are much cheaper
-  than one mid-size step, so transitions spread into even ramps, and an
-  isolated speck (large *d* against every neighbor) is maximally
-  expensive.
-* **Linear above the threshold**: when the palette has a true gap that
-  no rearrangement can hide (Starry Night's blues vs oranges), the
-  cheapest rendering is one short, straight, crisp frontier — a linear
-  penalty is sparsity-promoting, so frontiers come out few and clean
-  instead of dithered into noise.
-* Thresholds scale with the offset, so a perfect linear ramp stays in
-  the quadratic regime at every scale; mid-scale seams and blocks do
-  not.
+| stage | multi-scale Huber (RGB) | fragmentation | local roughness |
+|---|---|---|---|
+| stage 1 only | 77.4 | 0.004 | 6.28 |
+| + refinement, λ=25 | 42.5 | 0.085 | 4.79 |
+| **+ refinement, λ=12** | **38.4** | 0.064 | **4.62** |
 
-## The algorithm
+λ has an optimum: λ=0 gives a bullseye, λ≳75 over-constrains and starts
+pinching colour regions apart. Lower λ fragments regions less.
 
-1. **Palette sweep (x-axis).**  Fit a principal curve through the
-   pixel cloud in Lab space (iterated Hastie–Stuetzle, seeded by PCA).
-   Sorting pixels by their position along this curve and slicing into
-   columns makes the horizontal axis sweep the palette.  Unlike a
-   straight PCA sort, the curve *bends* with the color distribution, so
-   distinct color clusters never collapse onto the same column.
-2. **Vertical order (y-axis).**  Within each column, pixels are sorted
-   by their global *manifold rank* — a 1D ordering from recursive PCA
-   splits (with seam-minimizing flips at every merge) that keeps every
-   color cluster contiguous.  The ranking is the same for every column,
-   so equal colors sort to equal heights: bands line up across columns,
-   and minority colors form contiguous runs instead of scattered specks.
-3. **Column alignment.**  Each column is re-sorted so its colors line
-   up row-by-row with its neighbors, straightening band boundaries.
-4. **Polish.**  Greedy descent on the exact loss: millions of candidate
-   short-range swaps, proposed on independent sets so each accepted swap
-   is an exact improvement, until convergence.
+## Notes from the development
 
-A cautionary note from the experiments in this rewrite: self-organizing
-approaches that repeatedly match pixels to a blurred target reach
-*lower* loss values but sprinkle isolated dots the eye immediately
-notices — the mean-field target can't tell that a lone speck belongs in
-a distant region of its own color.  Greedy descent on the exact loss
-never creates specks.  Where metric and eye disagreed, the eye won.
+**RGB, not CIELab.** Working perceptually seems obviously right and made
+every painting visibly worse. Lab's cube root expands differences among
+dark colours, so the sort spends resolution separating shadows the eye
+cannot distinguish, and that surfaces as streaking. Measuring in Lab
+compounds the error, because the metric then shares the algorithm's blind
+spot.
 
-Regenerate all demos and scores with:
+**Smoothness metrics do not settle everything.** Eight were tried
+(adjacent-pixel sums, multi-scale Huber in Lab and RGB, pyramid
+roughness, directional anisotropy, stripe coherence, fragmentation). All
+of them rank stage 1 above stage 2, and human judgement puts stage 2
+clearly ahead. The reason is that they measure how *large* colour jumps
+are and never what *shape* boundaries take: stage 1's straight,
+grid-aligned seams cost the same as stage 2's curved, colour-following
+ones. `fragmentation` — the share of each colour outside its largest
+connected region — is the only measure here that captures structure
+rather than smoothness, and it is the one that agreed with the eye on λ.
 
-    python make_demos.py
+**Approaches that were tried and rejected**: manifold-rank layouts,
+greedy exact-loss polish, blur-target matching, blue-noise rebalancing,
+sliced optimal transport, semi-discrete transport (power diagrams),
+Isomap "unrolling" of the colour manifold, and deferring misfit pixels to
+a holding pool. The last is instructive — deferral degrades the pool's
+principal axis, which is the very thing the deferral test depends on, so
+eligibility collapses (99.7% → 12%) and the layout falls apart.
+
+**A regression test worth keeping**: a scrambled black-to-white gradient
+must come back as constant columns. Its colour cloud is 1-D
+(λ₂/λ₁ ≈ 10⁻¹³), so any method that normalises the second axis amplifies
+floating-point noise and sorts rows by it. Rank-based layouts score 0.00
+error; sliced optimal transport scored 11.5/255.

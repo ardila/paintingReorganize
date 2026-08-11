@@ -1,373 +1,249 @@
-"""Reorganize the pixels of a painting into a smooth color palette.
+"""Reorganize the pixels of a painting into a smooth colour palette.
 
-The output image:
-  * contains exactly the same pixels as the input (just rearranged),
-  * is a dense rectangle with the same dimensions as the input
-    (so the bounding box is as small as possible),
-  * is optimized so the color field is *visually* smooth.
+The output holds exactly the same pixels as the input, in the same dense
+rectangle, rearranged so the colour field reads as smooth.
 
-The loss
---------
-Visual smoothness is not the sum of adjacent-pixel differences: that sum
-is nearly the same whether a color transition is spread gently over 50
-pixels or concentrated in one hard seam, so optimizing it happily
-produces a few razor edges.  Instead, each pixel pair at offset s (for
-s in 1, 2, 4, 8) contributes a Huber penalty on its Lab distance d,
-weighted 1/s^2:
+Two stages.
 
-    huber(d)  =  d^2                    if d <= tau*s
-                 tau*s * (2d - tau*s)   otherwise
+1. SLIDING-WINDOW INITIALISATION  (seconds)
+   The original algorithm sorted each output column using only that
+   column's own pixels.  The height of a colour boundary is then an
+   order statistic of ~h samples, so it carries sampling noise of order
+   sqrt(h) rows - and neighbouring columns, estimating it independently,
+   disagree.  That disagreement is what showed up as jagged "spikes" and
+   vertical chatter.
 
-The quadratic regime means many small steps are far cheaper than one
-mid-size step, so the optimizer spreads transitions into even ramps, and
-isolated specks (a large d against every neighbor) are maximally
-expensive.  Only a truly unavoidable palette gap - a jump beyond tau -
-escapes into the linear regime, where the cheapest option is one short,
-straight, crisp frontier rather than dither.  Thresholds scale with the
-offset so a clean linear ramp stays quadratic at every scale.
+   Here each column is cut from a WINDOW holding a few percent of the
+   picture: the sort direction and the composition are estimated from
+   that whole window, so the noise falls by sqrt(number of pooled
+   columns), and consecutive windows overlap by ~97%, so neighbouring
+   columns are cut from almost the same sample and can barely disagree.
+   Dealing every k-th pixel of the sorted window keeps each column
+   spanning the full range (taking a contiguous block instead collapses
+   the picture to colour = f(x)).
 
-The algorithm
--------------
-1.  Global layout ("what goes where"): fit a principal curve through the
-    color distribution (iterated Hastie-Stuetzle, seeded by the first
-    principal component).  Pixels sorted by position along the curve
-    form the columns: the horizontal axis sweeps the palette.
-2.  Vertical structure: within each column, pixels are sorted by their
-    global manifold-order rank - a 1D ordering built by recursive PCA
-    splits (with seam-minimizing flips) that keeps every color cluster
-    contiguous.  Because the ranking is identical for every column, the
-    same color always sorts to the same relative height: bands line up
-    across columns, and minority colors form contiguous runs instead of
-    being sprinkled as specks that no local optimizer could gather.
-3.  Column alignment: each column is re-sorted so its colors line up
-    with the rows of its neighbor columns' mean, straightening band
-    boundaries.
-4.  Polish: greedy descent on the exact loss with short-range swaps.
+2. PHYSICAL REFINEMENT  (minutes)
+   Pixels are then annealed under an energy with two terms:
 
-A note on optimizers that did NOT survive: majorize-minimize schemes
-that match pixels to a blurred/neighbor-mean target (self-organizing-map
-style) reach lower loss values but sprinkle isolated dots - the
-mean-field target cannot see that a lone speck should join a distant
-region of its own color, and accepts speck-creating trades for mid-scale
-gains.  Greedy descent on the exact loss never creates specks.  When
-metric and eye disagree, the eye wins.
+       E = sum_{s!=t} w(p_s - p_t) ||C_s - C_t||^2  -  lam * sum_s C_s . F(p_s)
 
-Usage:  python smooth_palette.py input.jpg [output.png]
+   * the one-body field F(p) = a*x*u1 + b*y*u2 (u1,u2 = principal colour
+     axes) fixes the COMPOSITION.  Minimising it alone is exactly the
+     optimal-transport map from the PC1/PC2 projection onto the grid, so
+     the left-to-right palette sweep becomes a genuine equilibrium
+     instead of a state that decays as the run continues.  A purely
+     pairwise energy cannot do this: being invariant to rotating the
+     picture, it can only prefer concentric blobs.
+   * the two-body kernel w fixes the TEXTURE.  It is a difference of
+     Gaussians - repulsive below ~2.5px, attractive from ~3-20px.  Plain
+     attraction at r=1 gathers the leftover colour dimension into 2-4px
+     clumps that read as grain; making the kernel hollow leaves that
+     residual as 1px dither, which the eye integrates away.
+
+   Pixels EXCHANGE rather than move, so the arrangement is a permutation
+   at every instant and every site stays filled by construction.  Since
+   the kernel is short-range and separable, the field w * C costs two
+   Gaussian blurs rather than a padded FFT.
+
+Note the annealing gets WORSE before it gets better: on Demoiselles the
+local roughness runs 6.3 -> 16.6 at peak heat -> 4.6 at the end, and the
+composition dips before exceeding its starting value.  Runs shorter than
+~2500 sweeps only show the damage.
+
+Colour space is RGB throughout.  Working in CIELab was tried and made
+every painting visibly worse: its cube root expands differences among
+dark colours, so the sort spends resolution separating shadows the eye
+cannot distinguish, which surfaces as streaking.
+
+Usage:  python smooth_palette.py input.jpg [output.png] [--fast]
 """
 
+import argparse
 import os
-import sys
+import time
 
 import numpy as np
 from PIL import Image
-from scipy.ndimage import gaussian_filter1d
-
-SCALES = (1, 2, 4, 8)
-SCALE_WEIGHTS = tuple(1.0 / (s * s) for s in SCALES)
-TAU = 60.0  # Huber threshold at scale 1, in Lab distance units
-
+from scipy.ndimage import gaussian_filter
 
 # ----------------------------------------------------------------------
-# Color conversion (sRGB -> CIELab)
+# Stage 1: sliding-window initialisation
 # ----------------------------------------------------------------------
 
-def srgb_to_lab(rgb):
-    """rgb: (..., 3) uint8 -> lab float32."""
-    c = rgb.astype(np.float64) / 255.0
-    c = np.where(c > 0.04045, ((c + 0.055) / 1.055) ** 2.4, c / 12.92)
-    m = np.array([[0.4124564, 0.3575761, 0.1804375],
-                  [0.2126729, 0.7151522, 0.0721750],
-                  [0.0193339, 0.1191920, 0.9503041]])
-    xyz = c @ m.T
-    xyz /= np.array([0.95047, 1.0, 1.08883])  # D65 white
-    eps, kappa = 216.0 / 24389.0, 24389.0 / 27.0
-    f = np.where(xyz > eps, np.cbrt(xyz), (kappa * xyz + 16.0) / 116.0)
-    lab = np.empty_like(xyz)
-    lab[..., 0] = 116.0 * f[..., 1] - 16.0
-    lab[..., 1] = 500.0 * (f[..., 0] - f[..., 1])
-    lab[..., 2] = 200.0 * (f[..., 1] - f[..., 2])
-    return lab.astype(np.float32)
+def _pc1(x):
+    c = x - x.mean(0)
+    _, v = np.linalg.eigh(c.T @ c)
+    return v[:, -1]
 
 
-# ----------------------------------------------------------------------
-# The loss
-# ----------------------------------------------------------------------
+def sliding_palette(rgb, window_frac=0.03):
+    """Columns cut from a sliding pool of `window_frac` of the picture."""
+    h, w, _ = rgb.shape
+    px = rgb.reshape(-1, 3).astype(np.float64)
 
-def _huber(d, tau):
-    """Elementwise Huber penalty of distances d with threshold tau."""
-    return np.where(d <= tau, d * d, tau * (2.0 * d - tau))
+    order = np.argsort((px - px.mean(0)) @ _pc1(px), kind='stable')
+    n_win = int(max(h, min(len(order), round(window_frac * w) * h)))
 
+    window = order[:n_win].copy()
+    ptr = n_win
+    out = np.zeros((h, w, 3), dtype=np.uint8)
+    direction = None
+    prev = None
 
-def smoothness_loss(lab_img):
-    """Multi-scale Huber smoothness loss, per pixel pair."""
-    total = 0.0
-    n_terms = 0
-    for s, w in zip(SCALES, SCALE_WEIGHTS):
-        dx = np.linalg.norm(lab_img[:, s:] - lab_img[:, :-s], axis=-1)
-        dy = np.linalg.norm(lab_img[s:, :] - lab_img[:-s, :], axis=-1)
-        total += w * (float(_huber(dx, TAU * s).sum())
-                      + float(_huber(dy, TAU * s).sum()))
-        n_terms += dx.size + dy.size
-    return total / n_terms
-
-
-def mean_edge(lab_img):
-    """Mean Lab distance between 4-neighbors (secondary metric)."""
-    dx = np.linalg.norm(lab_img[:, 1:] - lab_img[:, :-1], axis=-1)
-    dy = np.linalg.norm(lab_img[1:, :] - lab_img[:-1, :], axis=-1)
-    return (dx.sum() + dy.sum()) / (dx.size + dy.size)
-
-
-# ----------------------------------------------------------------------
-# Step 1-2: global layout
-# ----------------------------------------------------------------------
-
-def _principal_projection(pts):
-    centered = pts - pts.mean(axis=0)
-    cov = centered.T @ centered
-    _, vecs = np.linalg.eigh(cov)
-    return centered @ vecs[:, -1]
-
-
-def manifold_order(lab, leaf=256):
-    """1D ordering of pixels that follows the color distribution.
-
-    Recursively split the pixel set in half along its own principal
-    axis, order each half, then join the halves choosing the flip of
-    each that minimizes the color jump at the seam.  Unlike a plain
-    global PCA sort, colors that are far apart in 3D never interleave:
-    every color cluster ends up as one contiguous segment.
-    """
-
-    def rec(idx):
-        pts = lab[idx]
-        proj = _principal_projection(pts)
-        if len(idx) <= leaf:
-            return idx[np.argsort(proj, kind="stable")]
-        s = np.argsort(proj, kind="stable")
-        half = len(idx) // 2
-        oa = rec(idx[s[:half]])
-        ob = rec(idx[s[half:]])
-        k = min(32, len(oa), len(ob))
-        a0, a1 = lab[oa[:k]].mean(0), lab[oa[-k:]].mean(0)
-        b0, b1 = lab[ob[:k]].mean(0), lab[ob[-k:]].mean(0)
-        choices = [
-            (np.linalg.norm(a1 - b0), False, False),
-            (np.linalg.norm(a1 - b1), False, True),
-            (np.linalg.norm(a0 - b0), True, False),
-            (np.linalg.norm(a0 - b1), True, True),
-        ]
-        _, flip_a, flip_b = min(choices, key=lambda c: c[0])
-        if flip_a:
-            oa = oa[::-1]
-        if flip_b:
-            ob = ob[::-1]
-        return np.concatenate([oa, ob])
-
-    return rec(np.arange(lab.shape[0]))
-
-
-def principal_curve_coords(lab, n_nodes=512, iters=6):
-    """Position of every pixel along a smooth principal curve through
-    color space (iterated Hastie-Stuetzle fit seeded by the first
-    principal component)."""
-    n = lab.shape[0]
-    n_nodes = min(n_nodes, max(8, n // 64))
-    centered = lab - lab.mean(axis=0)
-    cov = centered.T @ centered
-    _, vecs = np.linalg.eigh(cov)
-    t_ord = np.argsort(centered @ vecs[:, -1], kind="stable")
-
-    sigmas = np.geomspace(32.0, 8.0, iters)
-    bounds = np.linspace(0, n, n_nodes + 1).astype(np.int64)
-    lab64 = lab.astype(np.float64)
-    t_idx = np.empty(n, dtype=np.int64)
-    chunk = 1 << 18  # keep the pixels x nodes score matrix small
-    for it in range(iters):
-        nodes = np.add.reduceat(lab64[t_ord], bounds[:-1], axis=0)
-        nodes /= np.diff(bounds)[:, None]
-        nodes = gaussian_filter1d(nodes, sigma=sigmas[it], axis=0,
-                                  mode="nearest")
-        half_n2 = 0.5 * (nodes ** 2).sum(1)[None, :]
-        for lo in range(0, n, chunk):
-            scores = lab64[lo:lo + chunk] @ nodes.T - half_n2
-            t_idx[lo:lo + chunk] = np.argmax(scores, axis=1)
-        t_ord = np.argsort(t_idx, kind="stable")
-    return t_idx
-
-
-def initial_arrangement(lab, h, w):
-    """One coherent global sweep.
-
-    Pixels are sorted along the principal curve of the color
-    distribution and chunked into columns (left to right), so the
-    horizontal axis sweeps the palette.  Within each column, pixels are
-    sorted by their *global* manifold-order rank: because that ordering
-    is color-contiguous and identical for every column, the same color
-    always sorts to the same relative height - bands line up across
-    columns, and minority colors form contiguous runs instead of being
-    sprinkled as specks (which no local optimizer could later gather).
-    """
-    t = principal_curve_coords(lab)
-    rank = np.empty(lab.shape[0], dtype=np.int64)
-    rank[manifold_order(lab)] = np.arange(lab.shape[0])
-
-    order = np.argsort(t, kind="stable")
-    perm = np.empty(h * w, dtype=np.int64)
     for col in range(w):
-        chunk = order[col * h:(col + 1) * h]
-        chunk = chunk[np.argsort(rank[chunk], kind="stable")]
-        perm[col * h:(col + 1) * h] = chunk
-    # perm is column-major placement; convert to row-major pixel order.
-    return perm.reshape(w, h).T.reshape(-1)
+        cols_px = px[window]
+        v = _pc1(cols_px)
+        if direction is not None and v @ direction < 0:
+            v = -v                       # keep the axis pointing consistently
+        direction = v
+
+        rank = np.argsort(cols_px @ v, kind='stable')
+        m = len(window)
+        take = (((np.arange(h) + 0.5) * m) / h).astype(np.int64)
+        np.clip(take, 0, m - 1, out=take)
+        chosen = rank[take]
+        dealt = window[chosen]
+        colpx = px[dealt]
+
+        if prev is not None:
+            if (np.sqrt(((colpx[::-1] - prev) ** 2).sum(1)).mean()
+                    < np.sqrt(((colpx - prev) ** 2).sum(1)).mean()):
+                dealt, colpx = dealt[::-1], colpx[::-1]
+        prev = colpx
+        out[:, col, :] = colpx.astype(np.uint8)
+
+        keep = np.ones(m, dtype=bool)
+        keep[chosen] = False
+        need = min(h, len(order) - ptr)
+        window = np.concatenate([window[keep], order[ptr:ptr + need]])
+        ptr += need
+
+    return out
 
 
 # ----------------------------------------------------------------------
-# Step 3: column alignment
+# Stage 2: exchange dynamics under field + hollow kernel
 # ----------------------------------------------------------------------
 
-def align_columns(lab_img, idx_img, sweeps=8):
-    """Re-sort each column so its colors line up with the rows of the
-    mean of its two neighbor columns.  Straightens band boundaries and
-    removes chatter the initial ranking leaves behind."""
-    h, w, _ = lab_img.shape
-    for _ in range(sweeps):
-        for c in range(w):
-            lo, hi = max(0, c - 1), min(w - 1, c + 1)
-            ref = (lab_img[:, lo].astype(np.float64)
-                   + lab_img[:, hi].astype(np.float64)) / 2.0
-            col = lab_img[:, c].astype(np.float64)
-            scores = col @ ref.T - 0.5 * (ref ** 2).sum(1)[None, :]
-            key = np.argmax(scores, axis=1)
-            o = np.lexsort((np.arange(h), key))
-            lab_img[:, c] = lab_img[o, c]
-            idx_img[:, c] = idx_img[o, c]
+S_IN, S_OUT, B_AMP = 2.0, 8.0, 0.13      # difference-of-Gaussians kernel
 
 
-# ----------------------------------------------------------------------
-# Step 4: polish (greedy descent on the exact loss)
-# ----------------------------------------------------------------------
-
-POLISH_SCALES = (1, 2)  # energy terms considered during polish
+def _g(r2, s):
+    return np.exp(-r2 / (2.0 * s * s)) / (2.0 * np.pi * s * s)
 
 
-def _apply_swap(arrays, a, b):
-    for arr in arrays:
-        tmp = arr[a].copy()
-        arr[a] = arr[b]
-        arr[b] = tmp
+def _w_at(r2):
+    """Kernel value at squared separation (for the exact swap term)."""
+    return _g(r2, S_OUT) - B_AMP * _g(r2, S_IN)
 
 
-def _polish_site_cost(lab_img, ys, xs, colors, partner_ys, partner_xs):
-    """Huber cost of `colors` at sites (ys, xs) against current
-    neighbors at POLISH_SCALES, excluding the swap partner (its terms
-    are unchanged by the swap, and shared neighbors cancel in deltas)."""
-    h, w, _ = lab_img.shape
-    cost = np.zeros(ys.shape, dtype=np.float64)
-    for s in POLISH_SCALES:
-        wgt = 1.0 / (s * s)
-        for dy, dx in ((0, s), (0, -s), (s, 0), (-s, 0)):
-            ny, nx = ys + dy, xs + dx
-            valid = (ny >= 0) & (ny < h) & (nx >= 0) & (nx < w)
-            valid &= ~((ny == partner_ys) & (nx == partner_xs))
-            nyc, nxc = np.clip(ny, 0, h - 1), np.clip(nx, 0, w - 1)
-            d = np.linalg.norm(lab_img[nyc, nxc] - colors, axis=-1)
-            cost += np.where(valid, wgt * _huber(d, TAU * s), 0.0)
-    return cost
+def _potential(img):
+    """w * C, via two separable Gaussian blurs."""
+    return (gaussian_filter(img, sigma=(S_OUT, S_OUT, 0), mode='nearest')
+            - B_AMP * gaussian_filter(img, sigma=(S_IN, S_IN, 0), mode='nearest'))
 
 
-def polish(lab_img, idx_img, sweeps=30, verbose=True):
-    """Greedy descent on the exact Huber loss with short-range swaps.
+def make_field(rgb, gamma=1.0):
+    """F(p) = a*x*u1 + b*y*u2 on normalised coordinates.
 
-    Swap candidates are proposed on independent sets (strides wide
-    enough that concurrent swaps cannot interact), so every accepted
-    swap is an exact improvement of the loss.
+    gamma=1 gives a=b, so each axis's pull is automatically proportional
+    to its own standard deviation.  Whitening (b = 1/sigma_2) would blow
+    up when PC2 is numerically degenerate - a greyscale ramp - and sort
+    the rows by floating-point noise.
     """
-    h, w, _ = lab_img.shape
-    max_r = max(POLISH_SCALES)
-    offsets = [(0, 1), (1, 0), (1, 1), (1, -1), (0, 2), (2, 0),
-               (0, 3), (0, 4)]  # extra horizontal reach softens streaks
-    for sweep in range(sweeps):
-        total = 0
-        for dy, dx in offsets:
-            sy = abs(dy) + 2 * max_r + 1
-            sx = abs(dx) + 2 * max_r + 1
-            for py in range(sy):
-                for px in range(sx):
-                    ys, xs = np.mgrid[py:h:sy, px:w:sx]
-                    ys, xs = ys.ravel(), xs.ravel()
-                    ys2, xs2 = ys + dy, xs + dx
-                    ok = (ys2 >= 0) & (ys2 < h) & (xs2 >= 0) & (xs2 < w)
-                    ys, xs, ys2, xs2 = ys[ok], xs[ok], ys2[ok], xs2[ok]
-                    c1 = lab_img[ys, xs]
-                    c2 = lab_img[ys2, xs2]
-                    before = (_polish_site_cost(lab_img, ys, xs, c1,
-                                                ys2, xs2)
-                              + _polish_site_cost(lab_img, ys2, xs2, c2,
-                                                  ys, xs))
-                    after = (_polish_site_cost(lab_img, ys, xs, c2,
-                                               ys2, xs2)
-                             + _polish_site_cost(lab_img, ys2, xs2, c1,
-                                                 ys, xs))
-                    sw = (after - before) < -1e-9
-                    _apply_swap((lab_img, idx_img),
-                                (ys[sw], xs[sw]), (ys2[sw], xs2[sw]))
-                    total += int(sw.sum())
-        if verbose:
-            print(f"  polish sweep {sweep + 1}: {total} swaps, "
-                  f"loss={smoothness_loss(lab_img):.4f}", flush=True)
-        if total < (h * w) // 2000:
-            break
-    return lab_img
+    h, w, _ = rgb.shape
+    px = rgb.reshape(-1, 3).astype(np.float64)
+    c = px - px.mean(0)
+    ev, V = np.linalg.eigh(c.T @ c)
+    u1, u2 = V[:, -1], V[:, -2]
+    s1, s2 = np.sqrt(ev[-1] / len(px)), np.sqrt(ev[-2] / len(px))
+    a, b = 1.0, (s2 / max(s1, 1e-12)) ** (gamma - 1.0)
+    ys, xs = np.mgrid[0:h, 0:w]
+    X = xs / (w - 1) * 2 - 1
+    Y = ys / (h - 1) * 2 - 1
+    return a * X[..., None] * u1[None, None, :] + b * Y[..., None] * u2[None, None, :]
+
+
+def sweep(img, F, lam, rng, T, batch=0.30, min_sep=3):
+    """One parallel batch of proposed exchanges, Metropolis-accepted."""
+    h, w, _ = img.shape
+    n = h * w
+    phi = _potential(img)
+    m = int(n * batch) // 2 * 2
+    s = rng.choice(n, size=m, replace=False)
+    a, b = s[:m // 2], s[m // 2:]
+    ya, xa = a // w, a % w
+    yb, xb = b // w, b % w
+    r2 = (ya - yb) ** 2.0 + (xa - xb) ** 2.0
+    ok = r2 >= min_sep ** 2               # simultaneous swaps must not interact
+    ya, xa, yb, xb, r2 = ya[ok], xa[ok], yb[ok], xb[ok], r2[ok]
+
+    ca, cb = img[ya, xa], img[yb, xb]
+    d = cb - ca
+    pair = 2.0 * (d * (phi[ya, xa] - phi[yb, xb])).sum(-1) \
+        - 2.0 * (d * d).sum(-1) * _w_at(r2)
+    fld = 0.5 * (d * (F[ya, xa] - F[yb, xb])).sum(-1)
+    gain = pair + lam * fld
+
+    acc = (gain > 0) if T <= 0 else \
+        ((gain > 0) | (rng.random(len(gain)) < np.exp(np.clip(gain / T, -60, 0))))
+    ya, xa, yb, xb = ya[acc], xa[acc], yb[acc], xb[acc]
+    tmp = img[ya, xa].copy()
+    img[ya, xa] = img[yb, xb]
+    img[yb, xb] = tmp
+
+
+def refine(seed, rgb, lam=12.0, sweeps=6000, t0=1500.0, t1=0.02, seed_rng=11,
+           verbose=True):
+    """Anneal `seed` under the field + hollow kernel."""
+    img = seed.astype(np.float64)
+    F = make_field(rgb)
+    rng = np.random.default_rng(seed_rng)
+    temps = t0 * (t1 / t0) ** (np.arange(sweeps) / max(sweeps - 1, 1))
+    start = time.time()
+    for i, T in enumerate(temps):
+        sweep(img, F, lam, rng, T)
+        if verbose and (i + 1) % 500 == 0:
+            print(f"  sweep {i+1}/{sweeps} T={T:8.2f} "
+                  f"({time.time()-start:.0f}s)", flush=True)
+    for _ in range(300):                  # settle at zero temperature
+        sweep(img, F, lam, rng, 0.0)
+    return np.clip(img, 0, 255).astype(np.uint8)
 
 
 # ----------------------------------------------------------------------
-# Pipeline
-# ----------------------------------------------------------------------
 
-def smooth_palette(rgb_image, verbose=True):
-    """rgb_image: (H, W, 3) uint8.  Returns rearranged (H, W, 3) uint8."""
-    h, w, _ = rgb_image.shape
-    pixels = rgb_image.reshape(-1, 3)
-    lab = srgb_to_lab(pixels)
-
-    perm = initial_arrangement(lab, h, w)
-    idx_img = perm.reshape(h, w).copy()
-    lab_img = lab[perm].reshape(h, w, 3).copy()
-    align_columns(lab_img, idx_img)
-    if verbose:
-        print(f"init  loss={smoothness_loss(lab_img):.4f}  "
-              f"edge={mean_edge(lab_img):.3f}", flush=True)
-
-    polish(lab_img, idx_img, verbose=verbose)
-
-    if verbose:
-        print(f"final loss={smoothness_loss(lab_img):.4f}  "
-              f"edge={mean_edge(lab_img):.3f}", flush=True)
-
-    out = pixels[idx_img.reshape(-1)]
-
-    # Constraint check: idx_img must still be a permutation, i.e. the
-    # output holds exactly the input's pixel multiset.
-    assert np.array_equal(np.sort(idx_img.reshape(-1)), np.arange(h * w)), \
-        "pixel multiset changed!"
-
-    return out.reshape(h, w, 3)
+def smooth_palette(rgb, window_frac=0.03, lam=12.0, sweeps=6000, verbose=True):
+    seed = sliding_palette(rgb, window_frac=window_frac)
+    if sweeps <= 0:
+        return seed
+    out = refine(seed, rgb, lam=lam, sweeps=sweeps, verbose=verbose)
+    assert np.array_equal(np.sort(out.reshape(-1, 3), axis=0),
+                          np.sort(rgb.reshape(-1, 3), axis=0)), \
+        "output is not a rearrangement of the input pixels"
+    return out
 
 
 def main():
-    sys.setrecursionlimit(100000)
-    if len(sys.argv) < 2:
-        print("Usage: python smooth_palette.py input.jpg [output.png]")
-        sys.exit(1)
-    filename = os.path.expanduser(sys.argv[1])
-    output_name = sys.argv[2] if len(sys.argv) > 2 else "output.png"
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('input')
+    ap.add_argument('output', nargs='?', default='output.png')
+    ap.add_argument('--window', type=float, default=0.03,
+                    help='pool size as a fraction of the picture (default 0.03)')
+    ap.add_argument('--lam', type=float, default=12.0,
+                    help='composition-field strength (default 12)')
+    ap.add_argument('--sweeps', type=int, default=6000,
+                    help='annealing sweeps; 0 = initialisation only')
+    ap.add_argument('--fast', action='store_true',
+                    help='initialisation only (seconds instead of minutes)')
+    args = ap.parse_args()
 
-    rgb = np.asarray(Image.open(filename).convert("RGB"))
-    result = smooth_palette(rgb)
-    Image.fromarray(result).save(output_name)
-    print(f"saved {output_name}")
+    rgb = np.asarray(Image.open(os.path.expanduser(args.input)).convert('RGB'))
+    out = smooth_palette(rgb, window_frac=args.window, lam=args.lam,
+                         sweeps=0 if args.fast else args.sweeps)
+    Image.fromarray(out).save(args.output)
+    print(f"saved {args.output}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

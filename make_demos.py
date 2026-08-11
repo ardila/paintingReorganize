@@ -1,13 +1,10 @@
-"""Generate before/after demo images for the README.
+"""Regenerate the before/after demo images.
 
-For each painting, produces <name>_smooth.png (the new algorithm's
-output) and demo_<name>.png (original | old algorithm | new algorithm,
-side by side), plus a score table comparing the two algorithms under
-the multi-scale Huber smoothness loss.
+Usage:  python make_demos.py [--fast] [name ...]
 
-Usage:  python make_demos.py [name ...]     (default: all)
+Stage 2 costs minutes per painting (Demoiselles ~27 min at 933x960;
+cost scales with pixel count), so --fast runs stage 1 only.
 """
-
 import sys
 
 import numpy as np
@@ -16,31 +13,30 @@ from PIL import Image, ImageDraw
 import smooth_palette as sp
 
 PAINTINGS = {
-    "starry_night": ("starry_night.png", "starry_night_palette.png"),
-    "demoiselles": ("demoiselles.jpg", "demoiselles_palette.png"),
-    "the_large_bathers": ("the_large_bathers.jpg",
-                          "the_large_bathers_palette.png"),
-    "kupka": ("input.jpg", "output.png"),
+    'demoiselles': ('demoiselles.jpg', 'demoiselles_palette.png'),
+    'starry_night': ('starry_night.png', 'starry_night_palette.png'),
+    'the_large_bathers': ('the_large_bathers.jpg',
+                          'the_large_bathers_palette.png'),
+    'kupka': ('input.jpg', 'output.png'),
 }
 
 
-def label(img, text):
-    img = img.convert("RGB")
-    draw = ImageDraw.Draw(img)
-    tw = draw.textlength(text)
-    draw.rectangle([4, 4, 12 + tw, 22], fill=(0, 0, 0))
-    draw.text((8, 8), text, fill=(255, 255, 255))
-    return img
-
-
-def side_by_side(images, texts, height=480):
+def strip(paths, labels, height=460):
     tiles = []
-    for im, tx in zip(images, texts):
-        w = int(round(im.width * height / im.height))
-        tiles.append(label(im.resize((w, height), Image.LANCZOS), tx))
+    for p, lbl in zip(paths, labels):
+        im = Image.open(p).convert('RGB') if isinstance(p, str) \
+            else Image.fromarray(p)
+        im = im.resize((int(im.width * height / im.height), height),
+                       Image.LANCZOS)
+        d = ImageDraw.Draw(im)
+        tw = d.textlength(lbl)
+        d.rectangle([4, 4, 14 + tw, 23], fill=(0, 0, 0))
+        d.text((9, 8), lbl, fill=(255, 255, 255))
+        tiles.append(im)
     gap = 8
-    total_w = sum(t.width for t in tiles) + gap * (len(tiles) - 1)
-    canvas = Image.new("RGB", (total_w, height), (255, 255, 255))
+    canvas = Image.new('RGB',
+                       (sum(t.width for t in tiles) + gap * (len(tiles) - 1),
+                        height), (255, 255, 255))
     x = 0
     for t in tiles:
         canvas.paste(t, (x, 0))
@@ -49,32 +45,18 @@ def side_by_side(images, texts, height=480):
 
 
 def main():
-    sys.setrecursionlimit(100000)
-    names = sys.argv[1:] or list(PAINTINGS)
-    rows = []
-    for name in names:
-        input_file, old_file = PAINTINGS[name]
-        print(f"=== {name}", flush=True)
-        rgb = np.asarray(Image.open(input_file).convert("RGB"))
-        result = sp.smooth_palette(rgb)
-        new_file = f"{name}_smooth.png"
-        Image.fromarray(result).save(new_file)
-
-        old_img = Image.open(old_file).convert("RGB")
-        demo = side_by_side(
-            [Image.open(input_file), old_img, Image.fromarray(result)],
-            ["original", "old algorithm", "new algorithm"],
-        )
-        demo.save(f"demo_{name}.png")
-
-        loss_old = sp.smoothness_loss(sp.srgb_to_lab(np.asarray(old_img)))
-        loss_new = sp.smoothness_loss(sp.srgb_to_lab(result))
-        rows.append((name, loss_old, loss_new))
-
-    print(f"\n{'painting':<20} {'old loss':>9} {'new loss':>9} {'ratio':>6}")
-    for name, lo, ln in rows:
-        print(f"{name:<20} {lo:>9.2f} {ln:>9.2f} {lo / ln:>6.1f}x")
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    fast = '--fast' in sys.argv
+    for name in (args or list(PAINTINGS)):
+        src, old = PAINTINGS[name]
+        print(f'=== {name}', flush=True)
+        rgb = np.asarray(Image.open(src).convert('RGB'))
+        out = sp.smooth_palette(rgb, sweeps=0 if fast else 6000)
+        Image.fromarray(out).save(f'{name}_smooth.png')
+        strip([src, old, out],
+              ['original', 'old algorithm', 'new algorithm']).save(
+            f'demo_{name}.png')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
