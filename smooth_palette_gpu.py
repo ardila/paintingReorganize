@@ -92,8 +92,11 @@ class MultiScaleKernel:
     attraction from a few px out to a fraction of the picture.
     """
 
-    def __init__(self, short_side, top_frac=0.40, sigma_min=4.0, hollow=0.5,
+    def __init__(self, short_side, top_frac=0.5, sigma_min=4.0, hollow=0.5,
                  sigma_hollow=1.5):
+        # top_frac=0.5 means the widest octave's 3-sigma reach spans the
+        # whole picture; with the ~1/r^2 weighting there is nothing left
+        # to tune about "reach", so it is not exposed as a knob.
         # Octave ladder from sigma_min up to a fraction of the picture.
         # EQUAL weights, not 1/sigma^2: a Gaussian of width s contributes
         # ~1/s^2 at its own scale, so equal weights make the sum behave
@@ -228,7 +231,7 @@ def calibrate_t0(img, F, kern, lam, accept=0.25, n_sample=200000, gen=None):
     return med / math.log(accept)          # both negative -> T0 positive
 
 
-def run(rgb, sweeps=6000, lam=12.0, top_frac=0.40, device='cuda',
+def run(rgb, sweeps=6000, lam=12.0, device='cuda',
         t0='auto', accept=0.25, t1_frac=2e-5, seed=11, verbose=True, log_every=500,
         frame_every=0, on_frame=None):
     """t0: starting temperature, or 'auto' to calibrate from the seed's
@@ -243,7 +246,7 @@ def run(rgb, sweeps=6000, lam=12.0, top_frac=0.40, device='cuda',
                        device=dev)
     ref = torch.tensor(rgb.transpose(2, 0, 1).astype(np.float32), device=dev)
     H, W = img.shape[1], img.shape[2]
-    kern = MultiScaleKernel(min(H, W), top_frac=top_frac)
+    kern = MultiScaleKernel(min(H, W))
     F = make_field(ref)
     gen = torch.Generator(device=dev).manual_seed(seed)
     if t0 == 'auto':
@@ -286,13 +289,10 @@ def main():
     ap.add_argument('output', nargs='?', default='output_gpu.png')
     ap.add_argument('--sweeps', type=int, default=6000)
     ap.add_argument('--lam', type=float, default=12.0)
-    ap.add_argument('--top-frac', type=float, default=0.40,
-                    help="widest kernel sigma as a fraction of the short side")
     ap.add_argument('--device', default='cuda')
     args = ap.parse_args()
     rgb = np.asarray(Image.open(args.input).convert('RGB'))
-    out = run(rgb, sweeps=args.sweeps, lam=args.lam, top_frac=args.top_frac,
-              device=args.device)
+    out = run(rgb, sweeps=args.sweeps, lam=args.lam, device=args.device)
     Image.fromarray(out).save(args.output)
     print(f"saved {args.output}")
 
