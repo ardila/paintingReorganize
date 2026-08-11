@@ -49,8 +49,7 @@ def _gauss1d(sigma, device, dtype):
     return k / k.sum()
 
 
-def blur(img, sigma):
-    """img: (3, H, W).  Separable Gaussian with replicate padding."""
+def _blur_direct(img, sigma):
     k = _gauss1d(sigma, img.device, img.dtype)
     r = (k.numel() - 1) // 2
     x = img.unsqueeze(0)
@@ -63,6 +62,27 @@ def blur(img, sigma):
     return x.squeeze(0)
 
 
+def blur(img, sigma):
+    """img: (3, H, W).  Gaussian blur, pyramid-accelerated for large sigma.
+
+    A direct separable blur costs O(N * sigma), which forbids the wide
+    octaves the long-range tail needs.  Blurring a 2^k-downsampled copy
+    at sigma/2^k and upsampling back costs O(N) at ANY sigma, and for a
+    smooth potential field the approximation error is irrelevant.
+    """
+    C, H, W = img.shape
+    if sigma <= 12.0:
+        return _blur_direct(img, sigma)
+    f = 1
+    while sigma / (2 * f) > 8.0 and min(H, W) // (2 * f) >= 8:
+        f *= 2
+    small = torch.nn.functional.avg_pool2d(img.unsqueeze(0), f)
+    small = _blur_direct(small.squeeze(0), sigma / f)
+    return torch.nn.functional.interpolate(
+        small.unsqueeze(0), size=(H, W), mode='bilinear',
+        align_corners=False).squeeze(0)
+
+
 class MultiScaleKernel:
     """w(r) = -b*G_s0(r) + sum_k a_k*G_sk(r),  a_k ~ 1/sigma_k^2.
 
@@ -72,7 +92,7 @@ class MultiScaleKernel:
     attraction from a few px out to a fraction of the picture.
     """
 
-    def __init__(self, short_side, top_frac=0.06, sigma_min=4.0, hollow=0.5,
+    def __init__(self, short_side, top_frac=0.40, sigma_min=4.0, hollow=0.5,
                  sigma_hollow=1.5):
         # Octave ladder from sigma_min up to a fraction of the picture.
         # EQUAL weights, not 1/sigma^2: a Gaussian of width s contributes
@@ -172,8 +192,11 @@ def sliding_palette_np(rgb):
     return sp.sliding_palette(rgb, window_frac=0.03)
 
 
-def run(rgb, sweeps=6000, lam=12.0, top_frac=0.06, device='cuda',
-        t0=1500.0, t1=0.02, seed=11, verbose=True, log_every=500):
+def run(rgb, sweeps=6000, lam=12.0, top_frac=0.40, device='cuda',
+        t0=1500.0, t1=0.02, seed=11, verbose=True, log_every=500,
+        frame_every=0, on_frame=None):
+    """frame_every/on_frame: every `frame_every` sweeps, call
+    on_frame(sweep_index, uint8_HxWx3_numpy) - for building videos."""
     dev = torch.device(device if torch.cuda.is_available() or device == 'cpu'
                        else 'cpu')
     seed_img = sliding_palette_np(rgb)
@@ -187,16 +210,24 @@ def run(rgb, sweeps=6000, lam=12.0, top_frac=0.06, device='cuda',
     if verbose:
         print(f"device={dev} {W}x{H} {kern.describe()}", flush=True)
 
+    def grab(i):
+        if on_frame is not None and frame_every and i % frame_every == 0:
+            on_frame(i, img.clamp(0, 255).round().to(torch.uint8)
+                     .cpu().numpy().transpose(1, 2, 0))
+
     start = time.time()
+    grab(0)
     for i in range(sweeps):
         T = t0 * (t1 / t0) ** (i / max(sweeps - 1, 1))
         sweep(img, F, kern, lam, T, gen=gen)
+        grab(i + 1)
         if verbose and (i + 1) % log_every == 0:
             el = time.time() - start
             print(f"  {i+1}/{sweeps} T={T:8.2f} {el:6.1f}s "
                   f"({el/(i+1)*1000:.1f} ms/sweep)", flush=True)
-    for _ in range(300):
+    for j in range(300):
         sweep(img, F, kern, lam, 0.0, gen=gen)
+        grab(sweeps + j + 1)
 
     out = img.clamp(0, 255).round().to(torch.uint8).cpu().numpy() \
         .transpose(1, 2, 0)
@@ -212,7 +243,7 @@ def main():
     ap.add_argument('output', nargs='?', default='output_gpu.png')
     ap.add_argument('--sweeps', type=int, default=6000)
     ap.add_argument('--lam', type=float, default=12.0)
-    ap.add_argument('--top-frac', type=float, default=0.06,
+    ap.add_argument('--top-frac', type=float, default=0.40,
                     help="widest kernel sigma as a fraction of the short side")
     ap.add_argument('--device', default='cuda')
     args = ap.parse_args()
