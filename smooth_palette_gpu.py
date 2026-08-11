@@ -192,10 +192,49 @@ def sliding_palette_np(rgb):
     return sp.sliding_palette(rgb, window_frac=0.03)
 
 
+def calibrate_t0(img, F, kern, lam, accept=0.25, n_sample=200000, gen=None):
+    """Pick the starting temperature from the energy landscape itself.
+
+    Sample random swap proposals at the seed and look at the UPHILL ones
+    (negative gain).  T0 is set so the median uphill proposal is accepted
+    with probability `accept`:  exp(median_gain/T0) = accept.
+
+    Why this beats a hand-picked constant: gain magnitudes scale with the
+    image's colour variance and with the kernel, so a T0 tuned on one
+    painting at one size (the old hard-coded 1500) melts a different one
+    either too much or not at all.  Calibrating to an acceptance RATE is
+    dimensionless and transfers.
+    """
+    C, H, W = img.shape
+    n = H * W
+    phi = kern.potential(img)
+    m = min(n_sample, n // 2 * 2)
+    perm = torch.randperm(n, device=img.device, generator=gen)[:m]
+    a, b = perm[:m // 2], perm[m // 2:]
+    ya, xa = a // W, a % W
+    yb, xb = b // W, b % W
+    r2 = (ya - yb).to(img.dtype) ** 2 + (xa - xb).to(img.dtype) ** 2
+    keep = r2 >= 9.0
+    a, b, r2 = a[keep], b[keep], r2[keep]
+    flat, pf, ff = img.reshape(3, -1), phi.reshape(3, -1), F.reshape(3, -1)
+    d = flat[:, b] - flat[:, a]
+    gain = (2.0 * (d * (pf[:, a] - pf[:, b])).sum(0)
+            - 2.0 * (d * d).sum(0) * kern.w_at(r2)
+            + lam * 0.5 * (d * (ff[:, a] - ff[:, b])).sum(0))
+    neg = gain[gain < 0]
+    if neg.numel() == 0:
+        return 1.0
+    med = float(neg.median())
+    return med / math.log(accept)          # both negative -> T0 positive
+
+
 def run(rgb, sweeps=6000, lam=12.0, top_frac=0.40, device='cuda',
-        t0=1500.0, t1=0.02, seed=11, verbose=True, log_every=500,
+        t0='auto', accept=0.25, t1_frac=2e-5, seed=11, verbose=True, log_every=500,
         frame_every=0, on_frame=None):
-    """frame_every/on_frame: every `frame_every` sweeps, call
+    """t0: starting temperature, or 'auto' to calibrate from the seed's
+    energy landscape (recommended - transfers across image sizes).
+    t1_frac: final temperature as a fraction of t0.
+    frame_every/on_frame: every `frame_every` sweeps, call
     on_frame(sweep_index, uint8_HxWx3_numpy) - for building videos."""
     dev = torch.device(device if torch.cuda.is_available() or device == 'cpu'
                        else 'cpu')
@@ -207,8 +246,12 @@ def run(rgb, sweeps=6000, lam=12.0, top_frac=0.40, device='cuda',
     kern = MultiScaleKernel(min(H, W), top_frac=top_frac)
     F = make_field(ref)
     gen = torch.Generator(device=dev).manual_seed(seed)
+    if t0 == 'auto':
+        t0 = calibrate_t0(img, F, kern, lam, accept=accept, gen=gen)
+    t1 = max(float(t0) * t1_frac, 1e-4)
     if verbose:
-        print(f"device={dev} {W}x{H} {kern.describe()}", flush=True)
+        print(f"device={dev} {W}x{H} {kern.describe()} "
+              f"T0={t0:.1f} T1={t1:.3g}", flush=True)
 
     def grab(i):
         if on_frame is not None and frame_every and i % frame_every == 0:
