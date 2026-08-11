@@ -50,15 +50,16 @@ def _gauss1d(sigma, device, dtype):
 
 
 def _blur_direct(img, sigma):
+    C = img.shape[0]
     k = _gauss1d(sigma, img.device, img.dtype)
     r = (k.numel() - 1) // 2
     x = img.unsqueeze(0)
     x = torch.nn.functional.pad(x, (r, r, 0, 0), mode='replicate')
-    x = torch.nn.functional.conv2d(x, k.view(1, 1, 1, -1).expand(3, 1, 1, -1),
-                                   groups=3)
+    x = torch.nn.functional.conv2d(x, k.view(1, 1, 1, -1).expand(C, 1, 1, -1),
+                                   groups=C)
     x = torch.nn.functional.pad(x, (0, 0, r, r), mode='replicate')
-    x = torch.nn.functional.conv2d(x, k.view(1, 1, -1, 1).expand(3, 1, -1, 1),
-                                   groups=3)
+    x = torch.nn.functional.conv2d(x, k.view(1, 1, -1, 1).expand(C, 1, -1, 1),
+                                   groups=C)
     return x.squeeze(0)
 
 
